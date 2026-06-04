@@ -12,7 +12,8 @@
  */
 
 #include "tile_cuda.h"
-#include <math.h>
+#include <cmath>
+#include <cstdio>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
