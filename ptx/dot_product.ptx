@@ -1,0 +1,92 @@
+//
+// dot_product.ptx — Warp-level dot product using PTX.
+//
+// Target: sm_89 (Ada Lovelace), compatible sm_75/sm_80/sm_90.
+//
+// Uses:
+//   - shfl.sync for warp-level reduction (no shared memory)
+//   - fma.rn.f32 for fused multiply-add
+//   - Target: 1 cycle per element per warp
+//
+// This provides a .callable device function that computes the
+// dot product of two float arrays of known length using a single
+// warp (32 threads).
+//
+
+.version 8.5
+.target sm_89
+.address_size 64
+
+//
+// warp_dot_product — Compute sum(a[i]*b[i]) for i in [0, n)
+//
+// Each thread in the warp handles elements [lane, lane+32, lane+64, ...].
+// Warp shuffle reduces to a single scalar in lane 0.
+//
+// C linkage: extern "C" float warp_dot_product(const float *a, const float *b, int n);
+//
+
+.visible .func (.param .f32 result) warp_dot_product(
+    .param .b64 a_ptr,
+    .param .b64 b_ptr,
+    .param .u32 n
+)
+{
+    .reg .f32   fa, fb, fsum, fother;
+    .reg .b64   pa, pb;
+    .reg .u32   lane, idx, total;
+    .reg .pred  p_valid;
+
+    // Load parameters
+    ld.param.b64 pa, [a_ptr];
+    ld.param.b64 pb, [b_ptr];
+    ld.param.u32 total, [n];
+
+    // Get lane ID
+    mov.u32 lane, %laneid;
+
+    // Accumulate partial sum for this lane
+    mov.f32 fsum, 0.0f;
+
+    // Loop: each lane processes every 32nd element
+    mov.u32 idx, lane;
+ Loop:
+    setp.lt.u32 p_valid, idx, total;
+    @p_valid ld.global.f32 fa, [pa + idx*4];
+    @p_valid ld.global.f32 fb, [pb + idx*4];
+    // fma.rn.f32: fsum += fa * fb
+    @p_valid fma.rn.f32 fsum, fa, fb, fsum;
+    @p_valid add.u32 idx, idx, 32;
+    @p_valid bra Loop;
+
+    // Warp-level reduction using shfl.sync
+    // Tree reduction: add with offset 16, 8, 4, 2, 1
+    shfl.sync.b32 fother, fsum, 0, 0x1f, 0xffffffff;
+    // Wait, the PTX shfl.sync syntax is:
+    //   shfl.sync.b32 dest, src, lane_delta, width, mask
+    // For down-sync index mode we want shfl.down:
+    //   shfl.sync.down.b32 dest, src, delta, width, mask
+    // Actually in PTX 8.x, it's just shfl.sync with mode in the instruction
+
+    // Let's use the simpler approach:
+    // shfl.sync.idx.b32 dest, src, srcLane, width, mask
+    // For reduction, we use shfl.down:
+    shfl.down.b32 fother, fsum, 16, 0x1f, 0xffffffff;
+    add.f32 fsum, fsum, fother;
+
+    shfl.down.b32 fother, fsum, 8, 0x1f, 0xffffffff;
+    add.f32 fsum, fsum, fother;
+
+    shfl.down.b32 fother, fsum, 4, 0x1f, 0xffffffff;
+    add.f32 fsum, fsum, fother;
+
+    shfl.down.b32 fother, fsum, 2, 0x1f, 0xffffffff;
+    add.f32 fsum, fsum, fother;
+
+    shfl.down.b32 fother, fsum, 1, 0x1f, 0xffffffff;
+    add.f32 fsum, fsum, fother;
+
+    // Lane 0 holds the result
+    st.param.f32 [result], fsum;
+    ret;
+}

@@ -1,0 +1,122 @@
+//
+// hash.ptx — Hand-optimized BLAKE2b G-function using PTX registers.
+//
+// Target: Ada Lovelace (sm_89), also valid on sm_75/sm_80/sm_90.
+//
+// The G-function is the hot inner loop of BLAKE2b.  This PTX uses:
+//   - .reg .u64 for native 64-bit arithmetic
+//   - Manual rotate via shf.l.wrap for 32-bit halves (single instr on Maxwell+)
+//   - Minimal register pressure
+//
+// This file provides a .callable device function that can be linked
+// into any CUDA kernel.  It is NOT a standalone kernel.
+//
+
+.version 8.5
+.target sm_89
+.address_size 64
+
+//
+// blake2b_g_ptx — PTX implementation of BLAKE2b G(a,b,c,d, x,y)
+//
+// Function signature (device .callable):
+//   void blake2b_g_ptx(uint64_t &a, uint64_t &b, uint64_t &c, uint64_t &d,
+//                       uint64_t x, uint64_t y);
+//
+// Parameters passed by reference (pointer) for a,b,c,d, by value for x,y.
+//
+
+.visible .func blake2b_g_ptx(
+    .param .b64 .ptr .global .align 8 a_ptr,
+    .param .b64 .ptr .global .align 8 b_ptr,
+    .param .b64 .ptr .global .align 8 c_ptr,
+    .param .b64 .ptr .global .align 8 d_ptr,
+    .param .u64 x,
+    .param .u64 y
+)
+{
+    .reg .u64   ra, rb, rc, rd, rx, ry;
+    .reg .u64   tmp;
+    .reg .u32   lo, hi, t32;
+
+    // Load a, b, c, d
+    ld.param.u64  %ptr_a, [a_ptr];
+    ld.global.u64 ra, [%ptr_a];
+    ld.param.u64  %ptr_b, [b_ptr];
+    ld.global.u64 rb, [%ptr_b];
+    ld.param.u64  %ptr_c, [c_ptr];
+    ld.global.u64 rc, [%ptr_c];
+    ld.param.u64  %ptr_d, [d_ptr];
+    ld.global.u64 rd, [%ptr_d];
+
+    // Load x, y
+    ld.param.u64 rx, [x];
+    ld.param.u64 ry, [y];
+
+    // --- Step 1: a = a + b + x ---
+    add.u64 ra, ra, rb;
+    add.u64 ra, ra, rx;
+
+    // --- Step 2: d = rotr64(d ^ a, 32) ---
+    xor.b64 rd, rd, ra;
+    // rotr64 by 32: swap 32-bit halves using shf.l.wrap
+    // shf.l.wrap hi:d, lo:d by 32 bits → swaps halves
+    mov.b64 {lo, hi}, rd;
+    mov.b64 rd, {hi, lo};
+
+    // --- Step 3: c = c + d ---
+    add.u64 rc, rc, rd;
+
+    // --- Step 4: b = rotr64(b ^ c, 24) ---
+    xor.b64 rb, rb, rc;
+    // rotr64 by 24: shf.l.wrap by 24, then OR with leftover bits
+    mov.b64 {lo, hi}, rb;
+    shf.l.wrap.b32 t32, lo, hi, 24;
+    shf.l.wrap.b32 hi, hi, lo, 24;
+    mov.b64 rb, {t32, hi};
+
+    // --- Step 5: a = a + b + y ---
+    add.u64 ra, ra, rb;
+    add.u64 ra, ra, ry;
+
+    // --- Step 6: d = rotr64(d ^ a, 16) ---
+    xor.b64 rd, rd, ra;
+    mov.b64 {lo, hi}, rd;
+    shf.l.wrap.b32 t32, lo, hi, 16;
+    shf.l.wrap.b32 hi, hi, lo, 16;
+    mov.b64 rd, {t32, hi};
+
+    // --- Step 7: c = c + d ---
+    add.u64 rc, rc, rd;
+
+    // --- Step 8: b = rotr64(b ^ c, 63) ---
+    xor.b64 rb, rb, rc;
+    // rotr64 by 63 = rotr by 1 then shift right 63 position
+    // Actually: rotr64(x, 63) = (x >> 63) | (x << 1)
+    mov.b64 {lo, hi}, rb;
+    shf.l.wrap.b32 t32, lo, hi, 1;
+    shf.l.wrap.b32 hi, hi, lo, 1;
+    // The bit shifted out of the bottom goes to the top
+    // For rotr63, we need bit 0 to go to bit 63
+    // This is equivalent to shl by 1 plus the carry
+    // Simpler: shr.b64 by 63, then or with shl by 1
+    shr.u64 tmp, rb, 63;
+    shl.b64 rb, rb, 1;
+    or.b64 rb, rb, tmp;
+
+    // Store results
+    st.global.u64 [%ptr_a], ra;
+    st.global.u64 [%ptr_b], rb;
+    st.global.u64 [%ptr_c], rc;
+    st.global.u64 [%ptr_d], rd;
+
+    ret;
+}
+
+//
+// Note: The PTX above uses .param .b64 .ptr .global which requires
+// the pointers to be in global memory.  For shared/local memory,
+// change the state space accordingly.  The inline PTX path in
+// hash_kernel.cu uses pure register operations and is preferred
+// for performance.
+//

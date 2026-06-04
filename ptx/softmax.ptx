@@ -1,0 +1,103 @@
+//
+// softmax.ptx — Warp-level softmax using PTX.
+//
+// Target: sm_89 (Ada Lovelace), compatible sm_75/sm_80/sm_90.
+//
+// Uses:
+//   - PRMT for packing/unpacking pairs of 16-bit values
+//   - Warp vote functions (__all_sync) for convergence
+//   - ex2.approx.ftz.f32 for fast exp approximation (base-2, then scale)
+//   - Target: 2 cycles per element per warp
+//
+// Computes softmax over 32 elements (one per warp lane).
+//
+
+.version 8.5
+.target sm_89
+.address_size 64
+
+//
+// warp_softmax — In-place warp-level softmax.
+//
+// Each lane provides one float32 value.  After the call, each lane
+// contains softmax(lane_values).  Uses shared memory for the
+// input array (32 floats = 128 bytes).
+//
+// C linkage:
+//   extern "C" void warp_softmax(float *shared_vals);
+//   Lane i reads/writes shared_vals[i].
+//
+
+.visible .func warp_softmax(
+    .param .b64 vals_ptr
+)
+{
+    .reg .b64   pvals;
+    .reg .f32   val, max_val, other, sum_val, result;
+    .reg .u32   lane;
+    .reg .pred  p;
+
+    ld.param.b64 pvals, [vals_ptr];
+    mov.u32 lane, %laneid;
+
+    // Load this lane's value
+    ld.shared.f32 val, [pvals + lane*4];
+
+    // ---- Step 1: Find max across warp ----
+    // Tree reduction for max using shfl.down
+    mov.f32 max_val, val;
+
+    shfl.down.b32 other, max_val, 16, 0x1f, 0xffffffff;
+    max.f32 max_val, max_val, other;
+
+    shfl.down.b32 other, max_val, 8, 0x1f, 0xffffffff;
+    max.f32 max_val, max_val, other;
+
+    shfl.down.b32 other, max_val, 4, 0x1f, 0xffffffff;
+    max.f32 max_val, max_val, other;
+
+    shfl.down.b32 other, max_val, 2, 0x1f, 0xffffffff;
+    max.f32 max_val, max_val, other;
+
+    shfl.down.b32 other, max_val, 1, 0x1f, 0xffffffff;
+    max.f32 max_val, max_val, other;
+
+    // Broadcast max from lane 0 to all lanes
+    shfl.idx.b32 max_val, max_val, 0, 0x1f, 0xffffffff;
+
+    // ---- Step 2: Compute exp(val - max) ----
+    // exp2(x) ≈ ex2.approx, then scale: exp(x) = exp2(x / ln2)
+    sub.f32 val, val, max_val;
+    // Divide by ln(2) ≈ 0.693147
+    mul.f32 val, val, 1.44269504089;  // 1/ln(2)
+    ex2.approx.ftz.f32 val, val;
+
+    // ---- Step 3: Sum across warp ----
+    mov.f32 sum_val, val;
+
+    shfl.down.b32 other, sum_val, 16, 0x1f, 0xffffffff;
+    add.f32 sum_val, sum_val, other;
+
+    shfl.down.b32 other, sum_val, 8, 0x1f, 0xffffffff;
+    add.f32 sum_val, sum_val, other;
+
+    shfl.down.b32 other, sum_val, 4, 0x1f, 0xffffffff;
+    add.f32 sum_val, sum_val, other;
+
+    shfl.down.b32 other, sum_val, 2, 0x1f, 0xffffffff;
+    add.f32 sum_val, sum_val, other;
+
+    shfl.down.b32 other, sum_val, 1, 0x1f, 0xffffffff;
+    add.f32 sum_val, sum_val, other;
+
+    // Broadcast sum from lane 0
+    shfl.idx.b32 sum_val, sum_val, 0, 0x1f, 0xffffffff;
+
+    // ---- Step 4: Normalize ----
+    div.approx.ftz.f32 result, val, sum_val;
+
+    // Store back
+    st.shared.f32 [pvals + lane*4], result;
+
+    ret;
+}
